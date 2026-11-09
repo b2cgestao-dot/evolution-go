@@ -314,6 +314,32 @@ var (
 	authContainer *sqlstore.Container
 )
 
+// Cliente ativo por instância. Antes, cada StartClient criava um cliente novo sem desligar
+// o anterior, e todas as goroutines antigas escutavam o mesmo killChannel. Os clientes
+// órfãos seguiam conectados com a mesma sessão: o WhatsApp derrubava um quando outro
+// entrava, o Disconnected de cada um reiniciava o atual, e o fim do QR de um órfão matava
+// o cliente recém-pareado. Resultado: centenas de reinícios e "401: logged out from
+// another device" logo após parear.
+var (
+	activeMu      sync.Mutex
+	activeClients = map[string]*whatsmeow.Client{}
+	reconnecting  sync.Map
+)
+
+func setActiveClient(instanceID string, c *whatsmeow.Client) *whatsmeow.Client {
+	activeMu.Lock()
+	defer activeMu.Unlock()
+	prev := activeClients[instanceID]
+	activeClients[instanceID] = c
+	return prev
+}
+
+func isActiveClient(instanceID string, c *whatsmeow.Client) bool {
+	activeMu.Lock()
+	defer activeMu.Unlock()
+	return c != nil && activeClients[instanceID] == c
+}
+
 func (w whatsmeowService) sharedAuthContainer() (*sqlstore.Container, error) {
 	sharedAuthMu.Lock()
 	defer sharedAuthMu.Unlock()
@@ -451,6 +477,13 @@ func (w whatsmeowService) StartClient(cd *ClientData) {
 	}
 	clientLog := waLog.Stdout("Client", minLevel, true)
 	client := whatsmeow.NewClient(deviceStore, clientLog)
+
+	// Um cliente ativo por instância: o anterior é desligado aqui, sua goroutine sai
+	// sozinha (ver o loop no fim desta função) e os eventos dele passam a ser ignorados.
+	if prev := setActiveClient(cd.Instance.Id, client); prev != nil && prev != client {
+		w.loggerWrapper.GetLogger(cd.Instance.Id).LogInfo("[%s] Replacing previous client: disconnecting it", cd.Instance.Id)
+		prev.Disconnect()
+	}
 
 	w.clientPointer[cd.Instance.Id] = client
 
@@ -613,8 +646,20 @@ func (w whatsmeowService) StartClient(cd *ClientData) {
 	// Removed auto-reconnect logic to prevent infinite loops
 
 	for {
+		// Substituído por um cliente mais novo: sai sem mexer nos mapas nem reiniciar,
+		// senão apagaria o ponteiro do cliente atual ou criaria mais um em paralelo.
+		if !isActiveClient(cd.Instance.Id, client) {
+			w.loggerWrapper.GetLogger(cd.Instance.Id).LogInfo("[%s] Client superseded by a newer one, stopping old goroutine", cd.Instance.Id)
+			client.Disconnect()
+			return
+		}
 		select {
 		case <-w.killChannel[cd.Instance.Id]:
+			if !isActiveClient(cd.Instance.Id, client) {
+				w.loggerWrapper.GetLogger(cd.Instance.Id).LogInfo("[%s] Kill signal reached a superseded client, ignoring", cd.Instance.Id)
+				client.Disconnect()
+				return
+			}
 			w.loggerWrapper.GetLogger(cd.Instance.Id).LogInfo("Received kill signal for user '%s'", cd.Instance.Id)
 			client.Disconnect()
 
@@ -752,6 +797,11 @@ func (mycli *MyClient) handleQRCodes(codes []string) {
 			if mycli.WAClient == nil || mycli.WAClient.Store.ID != nil {
 				return
 			}
+			// QR de um cliente já substituído: parar sem teardown, senão o kill
+			// derrubaria o cliente ativo (às vezes recém-pareado).
+			if !isActiveClient(instanceID, mycli.WAClient) {
+				return
+			}
 			if mycli.passkeyCeremony != nil && mycli.passkeyCeremony.HasActiveByInstance(instanceID) {
 				mycli.loggerWrapper.GetLogger(instanceID).LogInfo("[%s] Passkey ceremony in progress — pausing QR rotation, keeping socket alive", instanceID)
 				return
@@ -828,7 +878,7 @@ func (mycli *MyClient) handleQRCodes(codes []string) {
 		// Ran out of codes without a PairSuccess. Treat as QR timeout (mirrors
 		// GetQRChannel's "timeout") — UNLESS a passkey ceremony is in flight, in
 		// which case the socket must stay alive for the ceremony to complete.
-		if mycli.WAClient != nil && mycli.WAClient.Store.ID == nil {
+		if mycli.WAClient != nil && mycli.WAClient.Store.ID == nil && isActiveClient(instanceID, mycli.WAClient) {
 			if mycli.passkeyCeremony != nil && mycli.passkeyCeremony.HasActiveByInstance(instanceID) {
 				mycli.loggerWrapper.GetLogger(instanceID).LogInfo("[%s] QR codes exhausted but passkey ceremony active — keeping socket alive", instanceID)
 				return
@@ -894,6 +944,11 @@ func (mycli *MyClient) teardownQR(reason string, forceLogout bool) {
 }
 
 func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
+	// Eventos de um cliente substituído (ainda fechando o socket) não podem mexer no
+	// estado da instância: um Disconnected dele reiniciaria o cliente atual.
+	if !isActiveClient(mycli.userID, mycli.WAClient) {
+		return
+	}
 	userID := mycli.userID
 	postMap := make(map[string]interface{})
 	postMap["data"] = rawEvt
@@ -2021,13 +2076,22 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 			mycli.loggerWrapper.GetLogger(mycli.userID).LogError("[%s] Error updating instance: %s", mycli.Instance.Id, err)
 		}
 
-		// Trigger instance restart via websocket-capable service (non-blocking)
-		go func(instanceID string) {
-			mycli.loggerWrapper.GetLogger(instanceID).LogInfo("[%s] Disconnected detected, restarting instance", instanceID)
-			if err := mycli.service.ReconnectClient(instanceID); err != nil {
-				mycli.loggerWrapper.GetLogger(instanceID).LogError("[%s] Failed to restart instance: %v", instanceID, err)
-			}
-		}(mycli.userID)
+		// Durante o pareamento (sem Store.ID) o WhatsApp fecha o socket de propósito, e o
+		// fluxo de QR já cuida disso; reconectar aqui recomeçava o QR do zero (PR oficial #192).
+		// Fora disso, uma reconexão por vez por instância.
+		if mycli.WAClient.Store.ID == nil {
+			mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] Disconnected during QR pairing, leaving it to the QR flow", mycli.userID)
+		} else if _, busy := reconnecting.LoadOrStore(mycli.userID, true); busy {
+			mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] Disconnected detected, reconnection already in progress", mycli.userID)
+		} else {
+			go func(instanceID string) {
+				defer time.AfterFunc(10*time.Second, func() { reconnecting.Delete(instanceID) })
+				mycli.loggerWrapper.GetLogger(instanceID).LogInfo("[%s] Disconnected detected, restarting instance", instanceID)
+				if err := mycli.service.ReconnectClient(instanceID); err != nil {
+					mycli.loggerWrapper.GetLogger(instanceID).LogError("[%s] Failed to restart instance: %v", instanceID, err)
+				}
+			}(mycli.userID)
+		}
 	case *events.LabelEdit:
 		doWebhook = true
 		postMap["event"] = "LabelEdit"

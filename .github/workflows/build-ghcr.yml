@@ -23,6 +23,6 @@ jobs:
           context: .
           platforms: linux/amd64
           push: true
-          build-args: VERSION=0.7.2-fix405-pool
-          tags: ghcr.io/b2cgestao-dot/evolution-go:0.7.2-fix405-pool
+          build-args: VERSION=0.7.2-fix405-pool-lifecycle
+          tags: ghcr.io/b2cgestao-dot/evolution-go:0.7.2-fix405-pool-lifecycle
           labels: org.opencontainers.image.source=https://github.com/b2cgestao-dot/evolution-go
