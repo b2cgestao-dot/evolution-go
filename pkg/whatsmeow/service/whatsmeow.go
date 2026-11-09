@@ -301,12 +301,64 @@ func (w whatsmeowService) ForceUpdateJid(instanceId string, number string) error
 	return nil
 }
 
+// Antes, cada StartClient (conectar, reconectar, gerar QR) chamava sqlstore.New, que abre
+// um *sql.DB novo, sem limite, e nunca o fechava. Uma instância deslogada em loop esgotava
+// o max_connections do Postgres e, a partir daí, nenhuma instância conectava nem gerava QR
+// ("pq: sorry, too many clients already"). Issues oficiais #109, #175 e #186.
+//
+// Agora o container é criado uma vez, com pool limitado, e compartilhado. O erro não é
+// memorizado (Mutex, não sync.Once): um banco fora do ar na primeira tentativa não deve
+// travar o processo até o próximo restart.
+var (
+	sharedAuthMu  sync.Mutex
+	authContainer *sqlstore.Container
+)
+
+func (w whatsmeowService) sharedAuthContainer() (*sqlstore.Container, error) {
+	sharedAuthMu.Lock()
+	defer sharedAuthMu.Unlock()
+
+	if authContainer != nil {
+		return authContainer, nil
+	}
+
+	var dbLog waLog.Logger
+	if w.config.WaDebug != "" {
+		dbLog = waLog.Stdout("Database", w.config.WaDebug, true)
+	}
+
+	dialect, address := "postgres", w.config.PostgresAuthDB
+	if address == "" {
+		dialect = "sqlite"
+		address = fmt.Sprintf("file:%s/dbdata/main.db?_pragma=foreign_keys(1)&_busy_timeout=5000&cache=shared&mode=rwc&_journal_mode=WAL", w.exPath)
+	}
+
+	db, err := sql.Open(dialect, address)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open auth database: %w", err)
+	}
+	if dialect == "postgres" {
+		db.SetMaxOpenConns(20)
+		db.SetMaxIdleConns(5)
+		db.SetConnMaxLifetime(30 * time.Minute)
+		db.SetConnMaxIdleTime(5 * time.Minute)
+	}
+
+	container := sqlstore.NewWithDB(db, dialect, dbLog)
+	if err := container.Upgrade(context.Background()); err != nil {
+		_ = container.Close()
+		return nil, fmt.Errorf("failed to upgrade auth database: %w", err)
+	}
+
+	authContainer = container
+	return container, nil
+}
+
 func (w whatsmeowService) StartClient(cd *ClientData) {
 
 	w.loggerWrapper.GetLogger(cd.Instance.Id).LogInfo("Starting websocket connection to Whatsapp for user '%s'", cd.Instance.Id)
 
 	var deviceStore *store.Device
-	var err error
 
 	if w.clientPointer[cd.Instance.Id] != nil {
 		if w.clientPointer[cd.Instance.Id].IsConnected() {
@@ -314,25 +366,8 @@ func (w whatsmeowService) StartClient(cd *ClientData) {
 		}
 	}
 
-	var container *sqlstore.Container
-
-	if w.config.WaDebug != "" {
-		dbLog := waLog.Stdout("Database", w.config.WaDebug, true)
-		if w.config.PostgresAuthDB != "" {
-			container, err = sqlstore.New(context.Background(), "postgres", w.config.PostgresAuthDB, dbLog)
-		} else {
-			dsn := fmt.Sprintf("file:%s/dbdata/main.db?_pragma=foreign_keys(1)&_busy_timeout=5000&cache=shared&mode=rwc&_journal_mode=WAL", w.exPath)
-			container, err = sqlstore.New(context.Background(), "sqlite", dsn, dbLog)
-		}
-	} else {
-		if w.config.PostgresAuthDB != "" {
-			container, err = sqlstore.New(context.Background(), "postgres", w.config.PostgresAuthDB, nil)
-		} else {
-			dsn := fmt.Sprintf("file:%s/dbdata/main.db?_pragma=foreign_keys(1)&_busy_timeout=5000&cache=shared&mode=rwc&_journal_mode=WAL", w.exPath)
-			container, err = sqlstore.New(context.Background(), "sqlite", dsn, nil)
-		}
-	}
-
+	// Um único container (e um único pool) para todas as instâncias: ver sharedAuthContainer.
+	container, err := w.sharedAuthContainer()
 	if err != nil {
 		w.loggerWrapper.GetLogger(cd.Instance.Id).LogError("[%s] Failed to create container: %v", cd.Instance.Id, err)
 		return
