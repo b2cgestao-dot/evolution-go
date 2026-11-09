@@ -338,8 +338,8 @@ func (w whatsmeowService) sharedAuthContainer() (*sqlstore.Container, error) {
 		return nil, fmt.Errorf("failed to open auth database: %w", err)
 	}
 	if dialect == "postgres" {
-		db.SetMaxOpenConns(20)
-		db.SetMaxIdleConns(5)
+		db.SetMaxOpenConns(10) // os outros 3 pools da EVO têm até 25 cada; max_connections padrão é 100
+		db.SetMaxIdleConns(3)
 		db.SetConnMaxLifetime(30 * time.Minute)
 		db.SetConnMaxIdleTime(5 * time.Minute)
 	}
